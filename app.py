@@ -46,6 +46,7 @@ st.title("📈 Screener IDX30 v4.2")
 c1, c2 = st.columns([3, 1])
 with c1:
     st.caption("Alat penyaring teknikal — bukan rekomendasi beli/jual.")
+    st.caption("Created by: [Muhammad Ribhan Hadiyan](https://ribhanhadyan.vercel.app/)")
 with c2:
     if st.button("🔄 Refresh data", use_container_width=True):
         sc.kosongkan_cache()
