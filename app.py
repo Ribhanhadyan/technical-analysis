@@ -1,10 +1,6 @@
 # app.py — Streamlit wrapper untuk screener_core.py (v4.2, tanpa backtest)
 # Install dependensi SEKALI lewat requirements.txt, bukan di dalam script:
 #   streamlit, yfinance, mplfinance, pandas, numpy, matplotlib
-
-import subprocess, sys
-subprocess.check_call([sys.executable, "-m", "pip", "install",
-                       "streamlit", "yfinance", "mplfinance"])
 import time
 import streamlit as st
 
