@@ -1070,25 +1070,31 @@ def simulasi_fhs(df, hari=20, n_sim=None, lookback=250, lam=0.94, seed=42):
     var = np.empty(L); var[0] = np.var(r[:min(20, L)]) + 1e-10
     for t in range(1, L):
         var[t] = lam * var[t-1] + (1 - lam) * r[t-1] ** 2
-    sig = np.sqrt(np.maximum(var, 1e-10))
-    z = r / sig
+    # floor vol harian 0.5%: saham 'tidur' (harga flat lama) bisa punya sigma ~0,
+    # lalu 1 lompatan ARA menghasilkan z raksasa → simulasi meledak jadi NaN/inf
+    SIG_MIN, SIG_MAX, Z_MAX, RET_MAX = 0.005, 0.15, 6.0, 0.40
+    sig = np.sqrt(np.maximum(var, SIG_MIN ** 2))
+    z = np.clip(np.nan_to_num(r / sig, nan=0.0, posinf=Z_MAX, neginf=-Z_MAX), -Z_MAX, Z_MAX)
     zc = z - z.mean()
-    up = np.log(h[1:] / c[:-1]) / sig
-    dn = np.log(l[1:] / c[:-1]) / sig
+    with np.errstate(divide="ignore", invalid="ignore"):
+        up = np.log(h[1:] / c[:-1]) / sig
+        dn = np.log(l[1:] / c[:-1]) / sig
+    up = np.clip(np.nan_to_num(up, nan=0.0, posinf=Z_MAX, neginf=-Z_MAX), -Z_MAX, Z_MAX)
+    dn = np.clip(np.nan_to_num(dn, nan=0.0, posinf=Z_MAX, neginf=-Z_MAX), -Z_MAX, Z_MAX)
 
     rng = np.random.default_rng(seed)
-    sig_s = np.full(n_sim, np.sqrt(lam * var[-1] + (1 - lam) * r[-1] ** 2))
+    sig_s = np.full(n_sim, np.clip(np.sqrt(lam * var[-1] + (1 - lam) * r[-1] ** 2), SIG_MIN, SIG_MAX))
     harga = np.full(n_sim, c[-1])
     cp, hp, lp = (np.empty((n_sim, hari)) for _ in range(3))
     for k in range(hari):
         idx = rng.integers(0, L, size=n_sim)
-        ret = sig_s * zc[idx]
+        ret = np.clip(sig_s * zc[idx], -RET_MAX, RET_MAX)
         u = np.maximum(sig_s * up[idx], ret)
         dd = np.minimum(sig_s * dn[idx], ret)
         hp[:, k], lp[:, k] = harga * np.exp(u), harga * np.exp(dd)
         harga = harga * np.exp(ret)
         cp[:, k] = harga
-        sig_s = np.sqrt(lam * sig_s ** 2 + (1 - lam) * ret ** 2)
+        sig_s = np.clip(np.sqrt(lam * sig_s ** 2 + (1 - lam) * ret ** 2), SIG_MIN, SIG_MAX)
     return cp, hp, lp
 
 
@@ -1130,7 +1136,10 @@ def analisa_lengkap(ticker, ihsg_close, period=PERIODE_DATA, hari=HARI_PROYEKSI,
     f = hitung_fitur(df, ihsg_close)
     if f is None: return None
     cp, hp, lp = simulasi_fhs(df, hari=hari, seed=seed)
-    p10, p50, p90 = np.percentile(cp[:, -1], [10, 50, 90])
+    p10, p50, p90 = np.nanpercentile(cp[:, -1][np.isfinite(cp[:, -1])], [10, 50, 90]) \
+        if np.isfinite(cp[:, -1]).any() else (np.nan, np.nan, np.nan)
+    if not all(np.isfinite([p10, p50, p90])):
+        raise ValueError("proyeksi FHS tidak valid (data harga tidak wajar)")
     s1, r1 = f["support"], f["resistance"]
     f.update({
         "ticker": ticker, "tanggal": df.index[-1].date(),
