@@ -165,6 +165,7 @@ def _cache_get(key):
 
 def kosongkan_cache():
     DATA_CACHE.clear()
+    RT_CACHE.clear()      # cache realtime (didefinisikan di bagian 14a)
 
 
 def prefetch_data(tickers, period=PERIODE_DATA):
@@ -1410,6 +1411,337 @@ def buat_gambar_top(peta, top, mode=None):
 
 
 # =========================================================
+# 14a. REALTIME — data intraday + uji "expected vs screener"
+#      (tidak mengubah skoring/analisa teknikal; hanya membandingkan)
+# =========================================================
+RT_INTERVAL = "5m"          # 1m / 2m / 5m / 15m (Yahoo; data IDX tertunda ±10 menit)
+RT_PERIODE = "10d"          # riwayat intraday untuk profil volume harian
+RT_CACHE_TTL = 45           # detik
+RT_MAKS_FALLBACK = 8        # maks unduhan satuan bila batch gagal
+RT_TOL_MIN_PCT = 0.2        # gerak < ini (atau < 25% ATR) dianggap datar
+RT_RVOL_TINGGI = 1.2        # RVOL estimasi >= ini = volume 'ramai'
+RT_MIN_FRAC_VOL = 0.12      # volume belum dinilai bila baru < 12% sesi berjalan
+RT_CACHE = {}               # {(ticker, interval): (waktu, ringkasan)}
+
+RT_STATUS_TXT = {
+    "LIVE": "Sesi berjalan", "ISTIRAHAT": "Istirahat sesi", "SELESAI": "Sesi hari ini selesai",
+    "PRA": "Pasar belum buka", "MENUNGGU": "Menunggu data sesi hari ini",
+    "TUTUP": "Pasar tutup (analisis sudah memuat bar terakhir)", "TANPA_DATA": "Data realtime tidak tersedia",
+}
+
+
+def sesi_pasar(now=None):
+    """Sesi perdagangan IDX (WIB). Sen-Kam 09:00-12:00 & 13:30-15:50; Jum 09:00-11:30 & 14:00-15:50.
+    frac = porsi waktu perdagangan yang sudah lewat (0..1), dipakai bila profil volume historis kosong."""
+    now = pd.Timestamp.now(tz="Asia/Jakarta") if now is None else pd.Timestamp(now)
+    wd, t = now.weekday(), now.hour * 60 + now.minute
+    if wd >= 5:
+        return {"status": "TUTUP", "frac": 1.0}
+    a1, b1 = 9 * 60, (11 * 60 + 30 if wd == 4 else 12 * 60)
+    a2, b2 = (14 * 60 if wd == 4 else 13 * 60 + 30), 15 * 60 + 50
+    total = (b1 - a1) + (b2 - a2)
+    if t < a1: return {"status": "PRA", "frac": 0.0}
+    if t < b1: return {"status": "BERJALAN", "frac": (t - a1) / total}
+    if t < a2: return {"status": "ISTIRAHAT", "frac": (b1 - a1) / total}
+    if t < b2: return {"status": "BERJALAN", "frac": ((b1 - a1) + (t - a2)) / total}
+    return {"status": "TUTUP", "frac": 1.0}
+
+
+def _bersihkan_intraday(df):
+    d = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    d = d.dropna(subset=["Close"])
+    for c in ("Open", "High", "Low"):
+        d[c] = d[c].fillna(d["Close"])
+    d["Volume"] = d["Volume"].fillna(0)
+    idx = pd.to_datetime(d.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("Asia/Jakarta").tz_localize(None)
+    d.index = idx
+    return d[~d.index.duplicated(keep="last")].sort_index()
+
+
+def _fraksi_volume(prev, waktu_bar, fallback):
+    """Porsi volume harian yang biasanya sudah terjadi pada jam ini (median hari-hari sebelumnya).
+    Lebih akurat daripada linear karena volume intraday berbentuk U (ramai pagi & penutupan)."""
+    rasio = []
+    if not prev.empty:
+        n_max = prev.groupby(prev.index.date).size().max()
+        for _, dd in prev.groupby(prev.index.date):
+            if len(dd) < 0.8 * n_max:
+                continue
+            tot = float(dd["Volume"].sum())
+            if tot <= 0:
+                continue
+            mask = np.array([t <= waktu_bar for t in dd.index.time])
+            rasio.append(float(dd.loc[mask, "Volume"].sum()) / tot)
+    if len(rasio) >= 2:
+        return float(np.clip(np.median(rasio), 0.03, 1.0)), "riwayat"
+    return float(max(fallback, 0.03)), "linear"
+
+
+def ringkas_intraday(df, interval_menit=5, now=None):
+    """DataFrame intraday mentah -> ringkasan sesi terakhir (OHLC, VWAP, volume, fraksi volume)."""
+    if df is None or len(df) == 0:
+        return None
+    d = _bersihkan_intraday(df)
+    if d.empty:
+        return None
+    tgl = d.index[-1].date()
+    hari = pd.Series(d.index.date, index=d.index)
+    hi, prev = d[hari == tgl].copy(), d[hari != tgl]
+    vol = float(hi["Volume"].sum())
+    tp = (hi["High"] + hi["Low"] + hi["Close"]) / 3
+    cum_v = hi["Volume"].cumsum()
+    hi["vwap"] = ((tp * hi["Volume"]).cumsum() / cum_v.where(cum_v > 0)).ffill()
+    bar_awal = hi.index[-1]
+    bar_akhir = bar_awal + pd.Timedelta(minutes=interval_menit)
+    now = pd.Timestamp.now(tz="Asia/Jakarta") if now is None else pd.Timestamp(now)
+    now_naif = now.tz_convert("Asia/Jakarta").tz_localize(None) if now.tzinfo else now
+    lin = sesi_pasar(bar_akhir)["frac"]
+    frac, sumber = _fraksi_volume(prev, bar_awal.time(), lin)
+    return {"tgl": tgl, "open": float(hi["Open"].iloc[0]), "high": float(hi["High"].max()),
+            "low": float(hi["Low"].min()), "last": float(hi["Close"].iloc[-1]),
+            "vol": vol, "vwap": float(hi["vwap"].iloc[-1]) if vol > 0 else np.nan,
+            "n_bar": int(len(hi)), "bar_akhir": bar_akhir,
+            "delay_min": max(0.0, (now_naif - bar_akhir).total_seconds() / 60),
+            "frac_vol": frac, "frac_sumber": sumber, "seri": hi[["Close", "vwap"]]}
+
+
+def _unduh_intraday(kodes, interval):
+    out = {}
+    periode = "5d" if interval == "1m" else RT_PERIODE      # Yahoo: 1m hanya ±7 hari terakhir
+    try:
+        raw = yf.download(kodes, period=periode, interval=interval, auto_adjust=False,
+                          group_by="ticker", threads=True, progress=False, prepost=False)
+    except Exception:
+        raw = None
+    if raw is not None and not raw.empty:
+        multi = isinstance(raw.columns, pd.MultiIndex)
+        for t in kodes:
+            try:
+                d = raw[t] if multi else (raw if len(kodes) == 1 else None)
+                if d is not None and not d.dropna(how="all").empty:
+                    out[t] = d
+            except Exception:
+                pass
+    for t in [k for k in kodes if k not in out][:RT_MAKS_FALLBACK]:
+        try:
+            d = yf.Ticker(t).history(period=periode, interval=interval, auto_adjust=False)
+            if d is not None and not d.empty:
+                out[t] = d
+        except Exception:
+            pass
+    return out
+
+
+def ambil_realtime(tickers, force=False, interval=None, ttl=None):
+    """Ambil data intraday semua ticker (1 request batch) -> ({ticker: ringkasan}, [(ticker, alasan)]).
+    Hasil di-cache RT_CACHE_TTL detik per ticker agar auto-refresh tidak membanjiri Yahoo."""
+    interval = interval or RT_INTERVAL
+    ttl = RT_CACHE_TTL if ttl is None else ttl
+    menit = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30}.get(interval, 5)
+    kodes = list(dict.fromkeys(normalisasi_kode(t) for t in tickers))
+    sekarang, data, perlu = time.time(), {}, []
+    for t in kodes:
+        c = None if force else RT_CACHE.get((t, interval))
+        if c is not None and sekarang - c[0] < ttl:
+            data[t] = c[1]
+        else:
+            perlu.append(t)
+    gagal = []
+    if perlu:
+        mentah = _unduh_intraday(perlu, interval)
+        for t in perlu:
+            try:
+                r = ringkas_intraday(mentah.get(t), menit)
+            except Exception as e:
+                gagal.append((t, f"{type(e).__name__}: {e}")); continue
+            if r is None:
+                gagal.append((t, "data intraday kosong"))
+            else:
+                RT_CACHE[(t, interval)] = (sekarang, r)
+                data[t] = r
+    return data, gagal
+
+
+def arah_ekspektasi(m):
+    """Arah yang 'diharapkan' screener untuk hari berikutnya (bukan prediksi, hanya bias hasil skor)."""
+    k, bias = m["kategori"], m["det"]["bias"]
+    if k in KAT_LONG: return "NAIK"
+    if k == KAT_AVOID: return "TURUN"
+    if bias >= 2: return "NAIK"
+    if bias <= -2: return "TURUN"
+    return "NETRAL"
+
+
+def _arah_gerak(chg_pct, atr_pct):
+    tol = max(RT_TOL_MIN_PCT, 0.25 * (atr_pct or 0.0))
+    return "NAIK" if chg_pct >= tol else ("TURUN" if chg_pct <= -tol else "DATAR")
+
+
+def _tanda(ek, bullish):
+    """+1 bila peristiwa searah ekspektasi, -1 bila berlawanan, 0 bila ekspektasi netral."""
+    if ek == "NAIK":  return 1 if bullish else -1
+    if ek == "TURUN": return -1 if bullish else 1
+    return 0
+
+
+def bandingkan_realtime(m, rt, now=None):
+    """Bandingkan harga/kondisi realtime dengan ekspektasi hasil screener satu saham.
+    Mengembalikan dict: status, verdict (SESUAI/CAMPURAN/MENYIMPANG/None), poin, cek[...], dll."""
+    ek = arah_ekspektasi(m)
+    sesi = sesi_pasar(now)
+    out = {"ticker": m["ticker"], "ekspektasi": ek, "verdict": None, "poin": 0, "cek": [],
+           "status": "TANPA_DATA", "acuan": m["harga"], "tgl_scr": m["tanggal"], "sesi": sesi["status"]}
+    if not rt:
+        return out
+    out.update(harga=rt["last"], open=rt["open"], high=rt["high"], low=rt["low"], vwap=rt["vwap"],
+               bar_akhir=rt["bar_akhir"], delay_min=rt["delay_min"], seri=rt.get("seri"),
+               tgl_rt=rt["tgl"])
+    if rt["tgl"] <= m["tanggal"]:
+        # analisis screener sudah memuat bar terakhir yang ada di data intraday -> tidak ada sesi baru
+        out["status"] = {"PRA": "PRA", "TUTUP": "TUTUP"}.get(sesi["status"], "MENUNGGU")
+        return out
+    out["status"] = {"BERJALAN": "LIVE", "ISTIRAHAT": "ISTIRAHAT"}.get(sesi["status"], "SELESAI")
+
+    acuan, last = m["harga"], rt["last"]
+    chg_pct = (last / acuan - 1) * 100
+    atr_pct = m.get("atr_pct")
+    arah = _arah_gerak(chg_pct, atr_pct)
+    gap_pct = (rt["open"] / acuan - 1) * 100
+    out.update(chg_pct=chg_pct, gap_pct=gap_pct, arah_gerak=arah)
+    cek = []
+
+    def add(param, scr, real, tanda=0):
+        cek.append({"param": param, "scr": scr, "rt": real, "tanda": tanda})
+
+    # 1. Harga & arah
+    ek_txt = {"NAIK": "bias naik", "TURUN": "bias turun", "NETRAL": "bias netral"}[ek]
+    gerak_txt = {"NAIK": "naik", "TURUN": "turun", "DATAR": "datar"}[arah]
+    if ek == "NETRAL":
+        t_arah = 1 if arah == "DATAR" else 0
+    else:
+        t_arah = _tanda(ek, True) if arah == "NAIK" else (_tanda(ek, False) if arah == "TURUN" else 0)
+    add("Arah harga", f"Ekspektasi: {ek_txt} ({_meta(m['kategori'])[0]}, skor {m['skor']:+d})",
+        f"{gerak_txt.capitalize()} {_pct(chg_pct, 2)} dari penutupan {_rp(acuan)}", t_arah)
+    if abs(gap_pct) >= max(0.5, 0.5 * (atr_pct or 0)):
+        add("Gap pembukaan", "–", f"Buka {_rp(rt['open'])} ({_pct(gap_pct, 2)})", 0)
+
+    # 2. Rentang wajar hari ini (simulasi FHS, hari ke-1)
+    j = m.get("jalur")
+    if j is not None and len(j):
+        d1 = np.asarray(j)[:, 0]
+        d1 = d1[np.isfinite(d1)]
+        if len(d1):
+            b10, b90 = (float(x) for x in np.percentile(d1, [10, 90]))
+            out["band"] = (b10, b90)
+            if last > b90:
+                pos, tb = "Di atas rentang", _tanda(ek, True)
+            elif last < b10:
+                pos, tb = "Di bawah rentang", _tanda(ek, False)
+            else:
+                pos, tb = "Dalam rentang wajar", 1
+            out["posisi_band"] = pos
+            add("Rentang wajar hari ini", f"{_rp(b10)} – {_rp(b90)} (80%)", pos, tb)
+
+    # 3. Support / resistance
+    s1, r1 = m.get("support"), m.get("resistance")
+    if s1:
+        if last < s1:
+            add("Support", _rp(s1), f"Di bawah support ({_pct((last / s1 - 1) * 100)})", _tanda(ek, False))
+        elif rt["low"] <= s1 * 1.002:
+            add("Support", _rp(s1), "Menyentuh support lalu bertahan", _tanda(ek, True))
+        else:
+            add("Support", _rp(s1), f"Di atas support ({_pct((last / s1 - 1) * 100)})", 0)
+    if r1:
+        if last > r1:
+            add("Resistance", _rp(r1), f"Menembus resistance ({_pct((last / r1 - 1) * 100)})", _tanda(ek, True))
+        elif rt["high"] >= r1:
+            add("Resistance", _rp(r1), "Tembus sesaat lalu ditolak", _tanda(ek, False))
+        else:
+            add("Resistance", _rp(r1), f"Di bawah resistance ({_pct((last / r1 - 1) * 100)})", 0)
+
+    # 4. Rencana trade (hanya kandidat beli)
+    st = m.get("stop_target")
+    kena_sl = False
+    if st and m["kategori"] in KAT_LONG:
+        scr = f"SL {_rp(st['sl'])} · T1 {_rp(st['tp1'])}"
+        if rt["low"] <= st["sl"]:
+            kena_sl = True
+            add("Stop loss / Target", scr, "Menyentuh stop loss", -1)
+        elif rt["high"] >= st["tp1"]:
+            add("Stop loss / Target", scr, "Mencapai target 1", 1)
+        else:
+            sisa = (st["tp1"] / last - 1) * 100
+            add("Stop loss / Target", scr, f"Di antara SL & T1 ({_pct(sisa)} ke T1)", 0)
+    out["kena_sl"] = kena_sl
+
+    # 5. VWAP intraday
+    if rt["n_bar"] >= 3 and _ok(rt["vwap"]):
+        atas = last >= rt["vwap"]
+        add("VWAP intraday", "–", f"Harga {'di atas' if atas else 'di bawah'} VWAP {_rp(rt['vwap'])} "
+            f"({_pct((last / rt['vwap'] - 1) * 100, 2)})", _tanda(ek, atas))
+
+    # 6. Volume (estimasi akhir hari dari profil volume historis)
+    avg20 = float(m["df_full"]["Volume"].tail(20).mean())
+    vol_scr = (m["vol_verdict"] or "n/a").split(" | ")[0]
+    if avg20 > 0 and rt["frac_vol"] >= RT_MIN_FRAC_VOL and rt["vol"] > 0:
+        rvol = rt["vol"] / rt["frac_vol"] / avg20
+        out["rvol"] = rvol
+        if rvol >= RT_RVOL_TINGGI and arah != "DATAR":
+            tv = 1 if arah == ek else (-1 if ek in ("NAIK", "TURUN") else 0)
+            ket = "mendukung arah screener" if tv > 0 else ("berlawanan dengan screener" if tv < 0 else "ramai")
+        else:
+            tv = 0
+            ket = ("ramai, harga belum bergerak" if rvol >= RT_RVOL_TINGGI else
+                   "sepi" if rvol < 0.6 else "biasa")
+        add("Volume", vol_scr, f"RVOL estimasi {rvol:.1f}× ({ket})", tv)
+    else:
+        add("Volume", vol_scr, f"Belum cukup data (baru ±{rt['frac_vol'] * 100:.0f}% volume harian)", 0)
+
+    poin = sum(c["tanda"] for c in cek)
+    out["cek"], out["poin"] = cek, poin
+    out["verdict"] = ("MENYIMPANG" if kena_sl or poin <= -2 else "SESUAI" if poin >= 2 else "CAMPURAN")
+    return out
+
+
+def bandingkan_semua(hasil, rt_data, now=None):
+    rt_data = rt_data or {}
+    return {m["ticker"]: bandingkan_realtime(m, rt_data.get(m["ticker"]), now) for m in hasil}
+
+
+def hitung_verdict(h2h):
+    cnt = {"SESUAI": 0, "CAMPURAN": 0, "MENYIMPANG": 0, "lain": 0}
+    for h in (h2h or {}).values():
+        cnt[h["verdict"] if h.get("verdict") else "lain"] += 1
+    return cnt
+
+
+def buat_tabel_h2h(df_hasil, h2h, peta):
+    """Tabel head-to-head per saham (urutan sama dengan tabel screener)."""
+    rows = []
+    for tk in df_hasil["Ticker"]:
+        m, h = peta[tk], (h2h or {}).get(tk)
+        if h is None:
+            continue
+        st = m.get("stop_target")
+        row = {"Ticker": tk.replace(".JK", ""), "Kategori": _meta(m["kategori"])[0], "Skor": m["skor"],
+               "Ekspektasi": h["ekspektasi"].capitalize(), "Close": m["harga"],
+               "Harga RT": h.get("harga"), "Δ%": _r(h.get("chg_pct"), 2) if h.get("chg_pct") is not None else None,
+               "Rentang wajar": (f"{h['band'][0]:,.0f} – {h['band'][1]:,.0f}" if h.get("band") else None),
+               "Posisi": h.get("posisi_band"),
+               "Support": m["support"], "Resistance": m["resistance"],
+               "SL": st["sl"] if st and m["kategori"] in KAT_LONG else None,
+               "TP1": st["tp1"] if st and m["kategori"] in KAT_LONG else None,
+               "VWAP": _r(h.get("vwap")) if h.get("vwap") is not None else None,
+               "RVOL RT": _r(h.get("rvol"), 2) if h.get("rvol") is not None else None,
+               "Poin": h["poin"] if h.get("verdict") else None,
+               "Hasil": VERDICT_META[h["verdict"]][0] if h.get("verdict") else RT_STATUS_TXT[h["status"]]}
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# =========================================================
 # 14b. TAMPILAN HTML
 # =========================================================
 CSS_LAPORAN = r"""<style>
@@ -1476,6 +1808,14 @@ background:var(--bg);padding:20px;max-width:1120px;margin:0 auto;font-variant-nu
 .scr details.lipat>summary:focus-visible{outline:2px solid var(--biru)}
 .scr .panduan dt{font-weight:650;margin-top:10px}
 .scr .panduan dd{margin:0;max-width:72ch}
+.scr .h2h{margin-top:14px;border:1px solid var(--line);border-radius:6px;padding:12px 14px;background:#fbfcfd}
+.scr .h2h h3{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+.scr .h2h table{min-width:0;font-size:13px}
+.scr .h2h th,.scr .h2h td{padding:6px 8px}
+.scr .h2h .ok{color:var(--naik);font-weight:700}
+.scr .h2h .no{color:var(--turun);font-weight:700}
+.scr .h2h .nt{color:var(--mute)}
+.scr .h2h svg{display:block;width:100%;height:auto;max-height:180px;margin-top:10px}
 </style>"""
 
 
@@ -1566,7 +1906,111 @@ def _bar_rentang(m, long_):
     return h + f'<div class="mute kecil">{ket}.</div>'
 
 
-def html_kartu(m, momrank=None, gambar_b64=None, terbuka=False):
+RT_STATUS_SINGKAT = {"LIVE": "RT: live", "ISTIRAHAT": "RT: istirahat", "SELESAI": "RT: selesai",
+                     "PRA": "RT: pra-buka", "MENUNGGU": "RT: menunggu", "TUTUP": "RT: tutup",
+                     "TANPA_DATA": "RT: tanpa data"}
+VERDICT_META = {   # (label, latar, teks, aksen)
+    "SESUAI":     ("Sesuai screener", "#d8f1e3", "#075c34", "#0b8a4e"),
+    "CAMPURAN":   ("Campuran", "#f8ecc9", "#7a5400", "#b37a00"),
+    "MENYIMPANG": ("Menyimpang", "#f6dcde", "#8a1f28", "#c62f3a"),
+}
+
+
+def _pil_verdict(h, singkat=False):
+    v = h.get("verdict")
+    if v in VERDICT_META:
+        lbl, bg, fg, _ = VERDICT_META[v]
+        return f'<span class="pil" style="background:{bg};color:{fg}">{_e(lbl)}</span>'
+    return (f'<span class="pil" style="background:#e7eaee;color:#3d4853">'
+            f'{_e(RT_STATUS_TXT[h["status"]] if not singkat else RT_STATUS_SINGKAT[h["status"]])}</span>')
+
+
+def _svg_intraday(m, h):
+    """Grafik mini intraday: harga hari ini vs penutupan, rentang wajar, VWAP, support/resistance, SL/T1."""
+    seri = h.get("seri")
+    if seri is None or len(seri) < 2:
+        return ""
+    px = seri["Close"].astype(float).values
+    vw = seri["vwap"].astype(float).values
+    acuan, st = h["acuan"], m.get("stop_target")
+    garis = [("Close kemarin", acuan, "#8b97a3", "4 3")]
+    lv = []
+    if m.get("support"):    lv.append(("S", m["support"], "#2ca02c", "6 3"))
+    if m.get("resistance"): lv.append(("R", m["resistance"], "#d62728", "6 3"))
+    if st and m["kategori"] in KAT_LONG:
+        lv += [("SL", st["sl"], "#c62f3a", "2 3"), ("T1", st["tp1"], "#0b8a4e", "2 3")]
+    vals = list(px[np.isfinite(px)]) + [acuan]
+    band = h.get("band")
+    if band:
+        vals += list(band)
+    lo, hi = min(vals), max(vals)
+    atr = m.get("atr") or 0
+    for nm, v, w, d in lv:                       # level jauh dari rentang tidak dipaksa masuk grafik
+        if lo - atr <= v <= hi + atr:
+            garis.append((nm, v, w, d))
+    allv = vals + [v for _, v, _, _ in garis]
+    lo, hi = min(allv), max(allv)
+    pad = (hi - lo) * 0.06 or 1.0
+    lo, hi = lo - pad, hi + pad
+    W, H, L, R, T, B = 640, 150, 8, 70, 8, 8
+    X = lambda i: L + (W - L - R) * i / max(len(px) - 1, 1)
+    Y = lambda v: T + (H - T - B) * (1 - (v - lo) / (hi - lo))
+    s = [f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="Grafik intraday {_e(m["ticker"])}">']
+    if band:
+        s.append(f'<rect x="{L}" y="{Y(band[1]):.1f}" width="{W - L - R}" height="{max(Y(band[0]) - Y(band[1]), 1):.1f}" '
+                 f'fill="#d9cdf0" opacity=".55"/>')
+    for nm, v, w, d in garis:
+        s.append(f'<line x1="{L}" x2="{W - R}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" stroke="{w}" stroke-width="1" '
+                 f'stroke-dasharray="{d}"/><text x="{W - R + 4}" y="{Y(v) + 3:.1f}" font-size="10" fill="{w}">'
+                 f'{_e(nm)} {v:,.0f}</text>')
+    pts_v = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in enumerate(vw) if np.isfinite(v))
+    if pts_v:
+        s.append(f'<polyline points="{pts_v}" fill="none" stroke="#2456a6" stroke-width="1.2" opacity=".8"/>')
+    pts = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in enumerate(px) if np.isfinite(v))
+    s.append(f'<polyline points="{pts}" fill="none" stroke="#16222e" stroke-width="1.8"/>')
+    s.append(f'<circle cx="{X(len(px) - 1):.1f}" cy="{Y(px[-1]):.1f}" r="3.2" fill="#16222e"/>')
+    s.append(f'<text x="{W - R + 4}" y="{Y(px[-1]) - 5:.1f}" font-size="10.5" font-weight="700" fill="#16222e">'
+             f'Kini {px[-1]:,.0f}</text></svg>')
+    ket = ("Hitam: harga hari ini. Biru: VWAP. Ungu: rentang wajar 80% (simulasi). Abu putus-putus: penutupan "
+           "sebelumnya; hijau/merah: support/resistance dan SL/T1 bila relevan.")
+    return "".join(s) + f'<div class="mute kecil">{ket}</div>'
+
+
+def html_h2h(m, h):
+    """Panel head-to-head: hasil screener (kiri) vs kondisi realtime (kanan) per parameter."""
+    if h is None:
+        return ""
+    tgl_scr = h["tgl_scr"]
+    kepala = [f'<h3>Head-to-head: screener vs realtime {_pil_verdict(h)}</h3>']
+    if h["status"] in ("LIVE", "ISTIRAHAT", "SELESAI") or h.get("harga") is not None:
+        info = f'{RT_STATUS_TXT[h["status"]]}'
+        if h.get("harga") is not None:
+            info += f' · harga {_rp(h["harga"])}'
+            if h.get("chg_pct") is not None:
+                info += f' ({_pct(h["chg_pct"], 2)} vs penutupan {tgl_scr})'
+            info += f' · data s/d {h["bar_akhir"].strftime("%H:%M")} WIB'
+            if h["status"] == "LIVE" and h["delay_min"] >= 1:
+                info += f' (tertunda ±{h["delay_min"]:.0f} mnt)'
+        kepala.append(f'<p class="mute kecil" style="margin:0 0 8px">{_e(info)}</p>')
+    else:
+        kepala.append(f'<p class="mute kecil" style="margin:0 0 8px">{_e(RT_STATUS_TXT[h["status"]])}. '
+                      f'Klik "Update realtime" saat pasar berjalan.</p>')
+    if not h["cek"]:
+        return f'<div class="h2h">{"".join(kepala)}</div>'
+    glyph = {1: '<span class="ok" title="Sesuai ekspektasi screener">✓</span>',
+             -1: '<span class="no" title="Berlawanan dengan screener">✗</span>',
+             0: '<span class="nt" title="Informasi / netral">–</span>'}
+    baris = "".join(f'<tr><td>{_e(c["param"])}</td><td>{_e(c["scr"])}</td><td>{_e(c["rt"])}</td>'
+                    f'<td class="r">{glyph[c["tanda"]]}</td></tr>' for c in h["cek"])
+    tabel = ('<div class="tw"><table><tr><th>Parameter</th><th>Screener (penutupan ' + _e(str(tgl_scr)) +
+             ')</th><th>Realtime</th><th class="r">Cocok?</th></tr>' + baris + '</table></div>')
+    ringkas = (f'<p class="mute kecil" style="margin:8px 0 0">Poin kesesuaian {h["poin"]:+d} '
+               f'(≥ +2 sesuai, ≤ −2 menyimpang; kena stop loss otomatis menyimpang). '
+               f'Realtime bersumber dari Yahoo Finance dan bukan sinyal baru: skor screener di atas tidak berubah.</p>')
+    return f'<div class="h2h">{"".join(kepala)}{tabel}{_svg_intraday(m, h)}{ringkas}</div>'
+
+
+def html_kartu(m, momrank=None, gambar_b64=None, terbuka=False, h2h=None):
     det, st, ps = m["det"], m.get("stop_target"), m.get("posisi")
     lbl, aks, _, _, pen = _meta(m["kategori"])
     long_ = m["kategori"] in KAT_LONG and bool(st)
@@ -1627,19 +2071,39 @@ def html_kartu(m, momrank=None, gambar_b64=None, terbuka=False):
     html_warn = ('<div class="peringatan">' + "".join(f"<div>{_e(w)}</div>" for w in warn) + "</div>") if warn else ""
     img = f'<img class="grafik" alt="Grafik {_e(tk)}" src="data:image/png;base64,{gambar_b64}">' if gambar_b64 else ""
 
+    rt_ringkas = ""
+    if h2h is not None and h2h.get("harga") is not None:
+        chg = f' {_pct(h2h["chg_pct"], 1)}' if h2h.get("chg_pct") is not None else ""
+        rt_ringkas = (f'<span class="mute kecil">RT {_rp(h2h["harga"])}{chg}</span>'
+                      f'{_pil_verdict(h2h, singkat=True)}')
+    elif h2h is not None:
+        rt_ringkas = _pil_verdict(h2h, singkat=True)
     mutu = f'<span class="mute">Mutu sinyal {m["grade"]}</span>' if m["grade"] != "-" else ""
     ringkas = (f'<summary><span class="tk">{_e(tk)}</span><span class="mute">{_e(NAMA.get(tk, ""))}</span>'
                f'{_pil_kat(m["kategori"])}{_pil_skor(m["skor"])}{mutu}'
-               f'<span>{_rp(harga)}</span><span class="mute kecil">data {m["tanggal"]}</span></summary>')
+               f'<span>{_rp(harga)}</span><span class="mute kecil">data {m["tanggal"]}</span>{rt_ringkas}</summary>')
     return (f'<details class="kartu" style="--aks:{aks}"{" open" if terbuka else ""}>{ringkas}'
             f'<div class="kb"><p class="mute" style="margin-top:10px">{_e(pen)}</p>'
-            f'<div class="kolom">{kolom1}{kolom2}{kolom3}</div>{html_warn}{img}'
+            f'{html_h2h(m, h2h)}<div class="kolom">{kolom1}{kolom2}{kolom3}</div>{html_warn}{img}'
             f'<p class="mute kecil" style="margin-top:12px">{_e(m["narasi"])}</p></div></details>')
 
 
-def html_tabel(df_hasil, peta):
+def _sel_rt(h2h, m):
+    if h2h is None:
+        return ""
+    h = h2h.get(m["ticker"])
+    if h is None or h.get("harga") is None:
+        return '<td class="r">–</td><td>' + (_pil_verdict(h, singkat=True) if h else "–") + "</td>"
+    chg = (f'<span class="sub">{_pct(h["chg_pct"], 2)}</span>' if h.get("chg_pct") is not None else "")
+    return f'<td class="r">{_rp(h["harga"])}{chg}</td><td>{_pil_verdict(h)}</td>'
+
+
+def html_tabel(df_hasil, peta, h2h=None):
     th = ("<tr><th>Saham</th><th>Status</th><th>Skor</th><th>Rincian</th><th>Kondisi</th>"
-          "<th class='r'>Harga</th><th class='r'>Ke support / resistance</th><th class='r'>R/R</th><th>Catatan</th></tr>")
+          "<th class='r'>Harga</th><th class='r'>Ke support / resistance</th><th class='r'>R/R</th><th>Catatan</th>")
+    if h2h is not None:
+        th += "<th class='r'>Harga realtime</th><th>Realtime vs screener</th>"
+    th += "</tr>"
     rows = []
     for _, r in df_hasil.iterrows():
         m = peta[r["Ticker"]]
@@ -1663,7 +2127,7 @@ def html_tabel(df_hasil, peta):
             f'<td><b>{_arah_struktur(m)}</b><span class="sub">{_e(kond_sub)}</span></td>'
             f'<td class="r">{_rp(m["harga"])}</td>'
             f'<td class="r">{_pct(-js) if js is not None else "–"} / {_pct(jr) if jr is not None else "–"}</td>'
-            f'<td class="r">{rr}</td><td>{tags}</td></tr>')
+            f'<td class="r">{rr}</td><td>{tags}</td>{_sel_rt(h2h, m)}</tr>')
     return f'<div class="tw"><table>{th}{"".join(rows)}</table></div>'
 
 
@@ -1725,17 +2189,18 @@ def html_panduan():
             '</dl></details>')
 
 
-def bangun_laporan(hasil, df_hasil, top, dilewati, gambar=None):
+def bangun_laporan(hasil, df_hasil, top, dilewati, gambar=None, h2h=None):
     gambar = gambar or {}
     peta = {m["ticker"]: m for m in hasil}
     mom = df_hasil.set_index("Ticker")["MomRank"]
     tk_top = top["Ticker"].tolist()
-    kartu_top = "".join(html_kartu(peta[t], mom.get(t), gambar.get(t), terbuka=True) for t in tk_top)
+    kartu_top = "".join(html_kartu(peta[t], mom.get(t), gambar.get(t), terbuka=True,
+                                         h2h=(h2h or {}).get(t)) for t in tk_top)
     sisa = [t for t in df_hasil["Ticker"] if t not in tk_top]
-    kartu_sisa = "".join(html_kartu(peta[t], mom.get(t)) for t in sisa)
+    kartu_sisa = "".join(html_kartu(peta[t], mom.get(t), h2h=(h2h or {}).get(t)) for t in sisa)
     bagian = [CSS_LAPORAN, '<div class="scr">', html_header(hasil), html_ringkasan(hasil, top, dilewati),
               "<h2>Pilihan utama</h2>" + (kartu_top or '<p class="mute">Tidak ada.</p>'),
-              "<h2>Semua saham</h2>", html_tabel(df_hasil, peta),
+              "<h2>Semua saham</h2>", html_tabel(df_hasil, peta, h2h),
               '<h2>Detail saham lainnya</h2><p class="mute kecil">Klik baris untuk membuka.</p>' + kartu_sisa,
               html_panduan(), "</div>"]
     return "".join(bagian)
