@@ -1179,10 +1179,25 @@ def ring_hidden_div(m):
 GRADE_RANK = {"A": 0, "B": 1, "C": 2, "-": 3}
 
 
+GAGAL_TABEL = []   # [(ticker, pesan)] saham yang dilewati saat buat_tabel
+
+
+def _r(x, nd=None):
+    """round() aman: None / NaN / inf -> None (round(NaN) tanpa ndigits melempar ValueError)."""
+    try:
+        if x is None or not np.isfinite(x):
+            return None
+        return int(round(x)) if nd is None else round(float(x), nd)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def buat_tabel(hasil):
     mom = pd.Series({m["ticker"]: m["ret_126"] for m in hasil}).rank(pct=True) * 100
     rows = []
+    GAGAL_TABEL.clear()
     for m in hasil:
+      try:
         st, ps, det = m.get("stop_target") or {}, m.get("posisi") or {}, m["det"]
         rs = m.get("rs") or {}
         ev = m.get("event") or {}
@@ -1195,35 +1210,40 @@ def buat_tabel(hasil):
             "T": det["T"], "M": det["M"], "V": det["V"], "S": det["S"],
             "Regime": det["regime"], "Trend": m["trend"], "Bias": det["label_bias"],
             "Mingguan": m["mingguan"], "IHSG": m["regime_ihsg"],
-            "RSI": round(m["rsi"], 1),
-            "RVOL": round(m["vol_rvol"], 2) if _ok(m["vol_rvol"]) else None,
+            "RSI": _r(m["rsi"], 1),
+            "RVOL": _r(m["vol_rvol"], 2) if _ok(m["vol_rvol"]) else None,
             "Volume": m["vol_verdict"],
-            "ADX": round(m["adx"], 1) if _ok(m["adx"]) else None,
-            "ATR%": round(m["atr_pct"], 2) if m["atr_pct"] is not None else None,
-            "BB%": round(m["bb_pctb"], 2) if _ok(m["bb_pctb"]) else None,
-            "vs MA200%": round((m["harga"] / m["ma200"] - 1) * 100, 1) if _ok(m["ma200"]) else None,
-            "Mom6b%": round(m["ret_126"], 1) if _ok(m["ret_126"]) else None,
-            "MomRank": round(mom[m["ticker"]], 0),
-            "Jrk52wH%": round(m["jarak_52w"], 1),
-            "RS20%": round(rs["rs_20"], 2) if _ok(rs.get("rs_20")) else None,
-            "RS60%": round(rs["rs_60"], 2) if _ok(rs.get("rs_60")) else None,
+            "ADX": _r(m["adx"], 1) if _ok(m["adx"]) else None,
+            "ATR%": _r(m["atr_pct"], 2) if m["atr_pct"] is not None else None,
+            "BB%": _r(m["bb_pctb"], 2) if _ok(m["bb_pctb"]) else None,
+            "vs MA200%": _r((m["harga"] / m["ma200"] - 1) * 100, 1) if _ok(m["ma200"]) else None,
+            "Mom6b%": _r(m["ret_126"], 1) if _ok(m["ret_126"]) else None,
+            "MomRank": _r(mom[m["ticker"]], 0),
+            "Jrk52wH%": _r(m["jarak_52w"], 1),
+            "RS20%": _r(rs["rs_20"], 2) if _ok(rs.get("rs_20")) else None,
+            "RS60%": _r(rs["rs_60"], 2) if _ok(rs.get("rs_60")) else None,
             "Support": m["support"], "Resistance": m["resistance"],
-            "JrkSup%": round(m["jarak_support_pct"], 2) if m["jarak_support_pct"] is not None else None,
-            "JrkRes%": round(m["jarak_resistance_pct"], 2) if m["jarak_resistance_pct"] is not None else None,
+            "JrkSup%": _r(m["jarak_support_pct"], 2) if m["jarak_support_pct"] is not None else None,
+            "JrkRes%": _r(m["jarak_resistance_pct"], 2) if m["jarak_resistance_pct"] is not None else None,
             "GoldenZone": m["di_golden_zone"],
             "HiddenDiv": ring_hidden_div(m),
-            "Likuid(Rp M)": round(m["nilai_transaksi"] / 1e9, 1),
+            "Likuid(Rp M)": _r(m["nilai_transaksi"] / 1e9, 1),
             "SL": st.get("sl"), "TP1": st.get("tp1"), "TP2": st.get("tp2"),
-            "R/R": round(st["rr"], 2) if st else None,
+            "R/R": _r(st["rr"], 2) if st else None,
             "Lot": ps.get("lot"), "Nilai": ps.get("nilai"),
-            "RugiJikaARB%Modal": round(ps["rugi_arb_pct_modal"], 2) if ps else None,
-            "P10": round(m["proyeksi_p10"]), "P50": round(m["proyeksi_p50"]),
-            "P90": round(m["proyeksi_p90"]),
+            "RugiJikaARB%Modal": _r(ps["rugi_arb_pct_modal"], 2) if ps else None,
+            "P10": _r(m["proyeksi_p10"]), "P50": _r(m["proyeksi_p50"]),
+            "P90": _r(m["proyeksi_p90"]),
             "Event": ev_txt,
             "Filter": "; ".join(det["catatan"]),
             "Alasan": ", ".join(m["alasan"]), "Narasi": m["narasi"],
         })
+      except Exception as e:      # satu saham bermasalah tidak boleh menjatuhkan seluruh tabel
+        GAGAL_TABEL.append((m.get("ticker", "?"), f"{type(e).__name__}: {e}"))
+    if not rows:
+        return pd.DataFrame()
     d = pd.DataFrame(rows)
+    d["MomRank"] = pd.to_numeric(d["MomRank"], errors="coerce")
     d["_g"] = d["Grade"].map(GRADE_RANK)
     d = d.sort_values(["Skor", "_g", "MomRank"], ascending=[False, True, False])
     return d.drop(columns="_g").reset_index(drop=True)

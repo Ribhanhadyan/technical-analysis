@@ -81,6 +81,14 @@ with tab_scan:
             # semua yang berat (tabel, top-N, grafik, HTML) dihitung SEKALI di sini,
             # bukan di setiap rerun Streamlit
             df_hasil = sc.buat_tabel(hasil)
+            if sc.GAGAL_TABEL:
+                st.warning("Dilewati saat membuat tabel: " +
+                           "; ".join(f"{k} ({e})" for k, e in sc.GAGAL_TABEL))
+                ok_tk = set(df_hasil["Ticker"]) if not df_hasil.empty else set()
+                hasil = [m for m in hasil if m["ticker"] in ok_tk]
+            if df_hasil.empty:
+                st.error("Tidak ada saham yang berhasil diproses.")
+                st.stop()
             top, dilewati = sc.pilih_top(df_hasil, hasil, n=TOP_N)
             peta = {m["ticker"]: m for m in hasil}
             gambar = sc.buat_gambar_top(peta, top) if GRAFIK_TOP else {}
