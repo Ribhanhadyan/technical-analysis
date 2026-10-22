@@ -19,6 +19,7 @@ A technical-analysis screener for Indonesian stocks (IDX / BEI), built with Stre
 - **Diversified Top-N** – limits stocks per sector and rejects highly correlated picks.
 - **Optional corporate events** – ex-dividend / earnings date check (slower, off by default).
 - **Two views** – full-universe screener and a single-stock detail page.
+- **Realtime head-to-head** – live intraday data next to the screener result for every stock, with a verdict on whether the live price is *expected* by the screener (see below). No extra tab.
 
 ## How scoring works
 
@@ -87,12 +88,42 @@ MAKS_KORELASI = 0.80
 
 Sector and name maps (`SEKTOR`, `NAMA`) cover the default universe; tickers outside it appear under sector "Lainnya".
 
+## Realtime head-to-head (screener vs live market)
+
+The technical analysis is unchanged (it still uses completed daily candles). On top of it, the app downloads intraday bars (Yahoo Finance, default 5m, delayed ~10 minutes for IDX) and checks the live price against what the screener expected. It appears in the existing **Screener** and **Detail per Saham** tabs: no new tab.
+
+Where to look:
+
+- **Head-to-head: screener vs realtime** table (Screener tab): one row per stock with close, live price, change, expected range, position, RVOL and the verdict.
+- **Laporan lengkap**: the stock table gets *Harga realtime* and *Realtime vs screener* columns; every stock card shows a pill in its header and a panel with screener (left) vs realtime (right) per parameter, plus a small intraday chart.
+- **Pilihan utama**: each top pick shows its live price and verdict.
+
+What "expected" means (all derived from the screener result, nothing re-scored):
+
+| Check | Screener side | Realtime side |
+|---|---|---|
+| Direction | Bias: bullish candidates / bias >= +2 expect up; *Hindari dulu* / bias <= -2 expect down; else neutral | Move vs last close (flat if smaller than max(0.2%, 25% of ATR%)) |
+| Expected range | P10-P90 of day 1 of the FHS simulation | Live price inside / above / below |
+| Support / resistance | Nearest levels | Broke, rejected, or held |
+| Stop loss / Target 1 | Trade plan of buy candidates | Touched SL (always a deviation) or reached T1 |
+| VWAP | n/a | Price above / below intraday VWAP |
+| Volume | Volume verdict | Estimated full-day RVOL (volume so far divided by the share of daily volume normally traded by this time, taken from the last ~9 sessions) |
+
+Each check scores +1 (agrees with the screener), -1 (contradicts) or 0 (informational). Total >= +2 = **Sesuai screener**, <= -2 = **Menyimpang**, otherwise **Campuran**. Touching the stop loss is always **Menyimpang**.
+
+Notes:
+
+- Click **📡 Update realtime** to refresh, or enable **Auto-refresh realtime** in the sidebar (the full report reloads on each refresh, so open cards close again).
+- Outside trading hours there is no new session to compare; the panel says so instead of showing a verdict. Sessions: Mon-Thu 09:00-12:00 and 13:30-15:50, Fri 09:00-11:30 and 14:00-15:50 WIB.
+- Volume is judged only once ~12% of the session has passed. Realtime data is a comparison aid, not a new signal.
+- Programmatic use: `rt, gagal = sc.ambil_realtime(tickers)`, then `h2h = sc.bandingkan_semua(hasil, rt)` and pass `h2h=` to `sc.bangun_laporan(...)`.
+
 ## Project structure
 
 ```
 .
-├── app.py              # Streamlit UI (sidebar, scan tab, single-stock tab)
-├── screener_core.py    # All analysis: data, indicators, scoring, risk, FHS, charts, HTML report
+├── app.py              # Streamlit UI (sidebar, scan tab, single-stock tab, realtime head-to-head)
+├── screener_core.py    # All analysis: data, indicators, scoring, risk, FHS, realtime, charts, HTML report
 ├── requirements.txt    # streamlit, yfinance, mplfinance, pandas, numpy, matplotlib
 └── .devcontainer/      # Codespaces / dev container config
 ```
